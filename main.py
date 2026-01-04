@@ -67,10 +67,15 @@ def init_db() -> None:
                 account_id TEXT,
                 response_status INTEGER,
                 response_body TEXT,
-                created_at TEXT
+                created_at TEXT,
+                is_active INTEGER DEFAULT 1
             )
             """
         )
+        cursor.execute("PRAGMA table_info(accounts)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "is_active" not in columns:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN is_active INTEGER DEFAULT 1")
         conn.commit()
 
 
@@ -110,6 +115,126 @@ def token_exists(token2: str) -> bool:
         cursor.execute("SELECT 1 FROM accounts WHERE token2 = ? LIMIT 1", (token2,))
         row = cursor.fetchone()
     return bool(row)
+
+
+def get_token_owner_info(token2: str) -> tuple[str | None, str | None, int | None]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT accounts.created_at, users.username, accounts.user_id
+            FROM accounts
+            LEFT JOIN users ON users.user_id = accounts.user_id
+            WHERE accounts.token2 = ?
+            ORDER BY accounts.created_at DESC
+            LIMIT 1
+            """,
+            (token2,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None, None, None
+    created_at, username, user_id = row
+    return created_at, username, user_id
+
+
+def deactivate_token(user_id: int, token2: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE accounts SET is_active = 0 WHERE user_id = ? AND token2 = ?",
+            (user_id, token2),
+        )
+        conn.commit()
+
+
+def get_active_tokens(user_id: int) -> list[tuple[int, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.id, a.token2
+            FROM accounts a
+            JOIN (
+                SELECT token2, MAX(id) AS max_id
+                FROM accounts
+                WHERE user_id = ? AND is_active = 1
+                GROUP BY token2
+            ) latest ON latest.max_id = a.id
+            ORDER BY a.created_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    return [(int(row[0]), row[1]) for row in rows]
+
+
+def get_account_by_id(account_id: int) -> tuple[str, dict[str, object]] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                token2,
+                authorized,
+                token_valid,
+                can_make_more_orders,
+                rating,
+                status_value,
+                is_loyal,
+                active_subscriptions,
+                debt_flow_enabled,
+                debt_limit,
+                phone,
+                phones,
+                personal_phone_id,
+                phone_id,
+                uuid,
+                account_id
+            FROM accounts
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    (
+        token2,
+        authorized,
+        token_valid,
+        can_make_more_orders,
+        rating,
+        status_value,
+        is_loyal,
+        active_subscriptions,
+        debt_flow_enabled,
+        debt_limit,
+        phone,
+        phones,
+        personal_phone_id,
+        phone_id,
+        uuid,
+        account_id,
+    ) = row
+    parsed = {
+        "authorized": bool(authorized),
+        "token_valid": bool(token_valid),
+        "can_make_more_orders": can_make_more_orders,
+        "rating": rating,
+        "status_value": status_value,
+        "is_loyal": bool(is_loyal),
+        "active_subscriptions": json.loads(active_subscriptions) if active_subscriptions else [],
+        "debt_flow_enabled": bool(debt_flow_enabled),
+        "debt_limit": debt_limit,
+        "phone": phone,
+        "phones": json.loads(phones) if phones else {},
+        "personal_phone_id": personal_phone_id,
+        "phone_id": phone_id,
+        "uuid": uuid,
+        "account_id": account_id,
+    }
+    return token2, parsed
 
 
 def log_account(
@@ -199,6 +324,38 @@ def get_nested(data: dict, keys: list[str]) -> object | None:
     return current
 
 
+def normalize_response_data(response_data: dict) -> dict:
+    if isinstance(response_data.get("data"), dict):
+        return response_data["data"]
+    return response_data
+
+
+def build_account_summary_from_parsed(parsed: dict[str, object]) -> str:
+    active_subscriptions = parsed.get("active_subscriptions") or []
+    phones = parsed.get("phones") or {}
+    can_make_more_orders = parsed.get("can_make_more_orders") or "нет данных"
+    return "\n".join(
+        [
+            "✅ <b>Аккаунт добавлен</b>",
+            f"🔐 Авторизация: <b>{'да' if parsed.get('authorized') else 'нет'}</b>",
+            f"🧩 Валидность токена: <b>{'да' if parsed.get('token_valid') else 'нет'}</b>",
+            f"🚦 Разрешение на новые заказы: <b>{can_make_more_orders}</b>",
+            f"⭐ Рейтинг: <b>{parsed.get('rating') or 'нет данных'}</b>",
+            f"🧑‍💼 Статус пассажира: <b>{parsed.get('status_value') or 'нет данных'}</b>",
+            f"🎁 Лояльность: <b>{'да' if parsed.get('is_loyal') else 'нет'}</b>",
+            f"📦 Активные подписки: <b>{format_active_subscriptions(active_subscriptions)}</b>",
+            f"💳 Долговой флоу: <b>{'включен' if parsed.get('debt_flow_enabled') else 'выключен'}</b>",
+            f"📉 Лимит долга: <b>{parsed.get('debt_limit', 'нет данных')}</b>",
+            f"📱 Телефон: <b>{parsed.get('phone', 'нет данных')}</b>",
+            f"📞 Телефоны (карта): <b>{', '.join(phones.keys()) or 'нет данных'}</b>",
+            f"🆔 Личный phone id: <b>{parsed.get('personal_phone_id', 'нет данных')}</b>",
+            f"🆔 Phone ID: <b>{parsed.get('phone_id', 'нет данных')}</b>",
+            f"🆔 UUID клиента: <b>{parsed.get('uuid', 'нет данных')}</b>",
+            f"🆔 Внутренний ID пользователя: <b>{parsed.get('account_id', 'нет данных')}</b>",
+        ]
+    )
+
+
 def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("👤 Профиль", callback_data="menu_profile")],
@@ -232,12 +389,20 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
     user_id = update.effective_user.id
     accounts_count = get_accounts_count(user_id)
+    tokens = get_active_tokens(user_id)
+    buttons = [
+        [InlineKeyboardButton(token, callback_data=f"account_{account_id}")]
+        for account_id, token in tokens
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="profile_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
     text = (
         "👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{user_id}</code>\n"
-        f"👥 Аккаунтов: <b>{accounts_count}</b>"
+        f"👥 Аккаунтов: <b>{accounts_count}</b>\n"
+        "👇 Добавленные аккаунты:"
     )
-    await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=main_menu_keyboard(user_id in ADMIN_IDS))
+    await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def add_account_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -278,6 +443,7 @@ async def send_launch_request(token2: str) -> tuple[int, str, dict | None]:
 
 
 def build_account_summary(response_data: dict) -> tuple[str, dict[str, object]]:
+    response_data = normalize_response_data(response_data)
     flags = parse_typed_experiments(response_data.get("typed_experiments", {}).get("items", []))
     debt_flow = flags.get("turboapp_debt_flow", {})
     active_subscriptions = response_data.get("subscriptions", {}).get("active_subscriptions", [])
@@ -354,6 +520,11 @@ async def add_account_token(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     token2 = update.message.text.strip()
     context.user_data["token2"] = token2
     if token_exists(token2):
+        created_at, username, user_id = get_token_owner_info(token2)
+        owner_line = ""
+        if created_at:
+            owner_name = f"@{username}" if username else f"id {user_id}"
+            owner_line = f"\nПоследний ввод: <b>{created_at}</b> ({owner_name})"
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("✅ Да", callback_data="add_account_confirm_yes")],
@@ -361,8 +532,10 @@ async def add_account_token(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ]
         )
         await update.message.reply_text(
-            "⚠️ Такой token2 уже добавляли. Точно добавить этот аккаунт?",
+            "⚠️ Такой token2 уже добавляли. Точно добавить этот аккаунт?"
+            f"{owner_line}",
             reply_markup=keyboard,
+            parse_mode="HTML",
         )
         return ADD_ACCOUNT_CONFIRM
     await process_add_account(update.message, update.effective_user, token2)
@@ -382,6 +555,43 @@ async def add_account_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     await process_add_account(query.message, update.effective_user, token2)
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def account_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    account_id = int(query.data.split("_", 1)[1])
+    account_data = get_account_by_id(account_id)
+    if not account_data:
+        await query.edit_message_text("⚠️ Аккаунт не найден.", reply_markup=main_menu_keyboard(False))
+        return
+    token2, parsed = account_data
+    summary = build_account_summary_from_parsed(parsed)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑️ Удалить", callback_data=f"account_delete_{account_id}")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="profile_back")],
+        ]
+    )
+    await query.edit_message_text(
+        text=f"🔑 <code>{token2}</code>\n\n{summary}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def account_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    account_id = int(query.data.split("_", 2)[2])
+    account_data = get_account_by_id(account_id)
+    if not account_data:
+        await query.edit_message_text("⚠️ Аккаунт не найден.")
+        return
+    token2, _parsed = account_data
+    deactivate_token(update.effective_user.id, token2)
+    await query.edit_message_text("✅ Аккаунт удалён из профиля.")
+    await show_main_menu(update, context)
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -497,6 +707,9 @@ def build_app():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(profile, pattern="^menu_profile$"))
+    app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^profile_back$"))
+    app.add_handler(CallbackQueryHandler(account_details, pattern="^account_\\d+$"))
+    app.add_handler(CallbackQueryHandler(account_delete, pattern="^account_delete_\\d+$"))
     app.add_handler(CallbackQueryHandler(admin_menu, pattern="^menu_admin$"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^admin_back$"))
