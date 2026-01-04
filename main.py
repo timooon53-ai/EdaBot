@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -77,7 +77,7 @@ def init_db() -> None:
 def upsert_user(update: Update) -> None:
     """Логируем пользователя при старте."""
     user = update.effective_user
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     is_admin = 1 if user.id in ADMIN_IDS else 0
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -119,7 +119,7 @@ def log_account(
     response_status: int,
     response_body: str,
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -259,9 +259,10 @@ async def send_launch_request(token2: str) -> tuple[int, str, dict | None]:
         "x-oauth-token": token2,
     }
     url = "https://rida.app/3.0/launch"
-    print("➡️ Запрос launch", {"url": url, "headers": headers, "body": {}})
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json={})
+    body = "{}"
+    print("➡️ Запрос launch", {"url": url, "headers": headers, "body": body})
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        response = await client.post(url, headers=headers, content=body)
     print("⬅️ Ответ launch", {"status": response.status_code, "body": response.text})
     response_json = None
     try:
@@ -445,7 +446,7 @@ async def admin_handle_user_id(update: Update, context: ContextTypes.DEFAULT_TYP
                 VALUES (?, 1, ?)
                 ON CONFLICT(user_id) DO UPDATE SET is_allowed = 1
                 """,
-                (target_user_id, datetime.utcnow().isoformat()),
+                (target_user_id, datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
         await update.message.reply_text("✅ Доступ выдан.")
