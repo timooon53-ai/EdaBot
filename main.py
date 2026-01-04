@@ -259,12 +259,19 @@ async def send_launch_request(token2: str) -> tuple[int, str, dict | None]:
         "x-oauth-token": token2,
     }
     url = "https://rida.app/3.0/launch"
+    print("➡️ Запрос launch", {"url": url, "headers": headers, "body": {}})
     async with httpx.AsyncClient() as client:
         response = await client.post(url, headers=headers, json={})
+    print("⬅️ Ответ launch", {"status": response.status_code, "body": response.text})
     response_json = None
     try:
         response_json = response.json()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
+        try:
+            response_json = json.loads(response.text)
+        except json.JSONDecodeError:
+            response_json = None
+    if not isinstance(response_json, dict):
         response_json = None
     return response.status_code, response.text, response_json
 
@@ -316,19 +323,27 @@ def build_account_summary(response_data: dict) -> tuple[str, dict[str, object]]:
 async def process_add_account(message, user, token2: str) -> None:
     status_code, response_text, response_json = await send_launch_request(token2)
     if response_json is None:
-        await message.reply_text(
-            "⚠️ Не удалось распарсить ответ сервера. Проверьте токен и попробуйте снова."
+        log_account(
+            user_id=user.id,
+            token2=token2,
+            parsed={},
+            response_status=status_code,
+            response_body=response_text,
         )
-        return
-    summary, parsed = build_account_summary(response_json)
-    log_account(
-        user_id=user.id,
-        token2=token2,
-        parsed=parsed,
-        response_status=status_code,
-        response_body=response_text,
-    )
-    await message.reply_text(summary, parse_mode="HTML")
+        await message.reply_text(
+            "⚠️ Не удалось распарсить ответ сервера. "
+            "Ответ сохранён в базе, проверьте token2 и попробуйте снова."
+        )
+    else:
+        summary, parsed = build_account_summary(response_json)
+        log_account(
+            user_id=user.id,
+            token2=token2,
+            parsed=parsed,
+            response_status=status_code,
+            response_body=response_text,
+        )
+        await message.reply_text(summary, parse_mode="HTML")
     await message.reply_text(
         "✨ Главное меню", reply_markup=main_menu_keyboard(user.id in ADMIN_IDS)
     )
