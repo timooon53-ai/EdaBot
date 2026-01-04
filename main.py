@@ -258,7 +258,7 @@ async def send_launch_request(token2: str) -> tuple[int, str, dict | None]:
         "Authorization": f"Bearer {token2}",
         "x-oauth-token": token2,
     }
-    url = "https://rida.app/3.0/launch"
+    url = "https://tc.mobile.yandex.net/3.0/launch"
     body = "{}"
     print("➡️ Запрос launch", {"url": url, "headers": headers, "body": body})
     async with httpx.AsyncClient(follow_redirects=True) as client:
