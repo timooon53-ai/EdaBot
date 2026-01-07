@@ -1,7 +1,6 @@
-import random
+import json
 import sqlite3
-import string
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -20,17 +19,12 @@ from cfg import ADMIN_IDS, TOKEN
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "bot.sqlite3"
-IMAGES_DIR = BASE_DIR / "images"
 
 (
-    REFUND_TOKEN,
-    REFUND_ORDER_ID,
-    REFUND_PHOTO_CHOICE,
-    REFUND_PHOTO,
-    REFUND_TEXT,
-    REFUND_CONFIRM,
+    ADD_ACCOUNT_TOKEN,
+    ADD_ACCOUNT_CONFIRM,
     ADMIN_WAIT_USER_ID,
-) = range(7)
+) = range(3)
 
 
 def init_db() -> None:
@@ -46,36 +40,49 @@ def init_db() -> None:
                 first_name TEXT,
                 last_name TEXT,
                 is_allowed INTEGER DEFAULT 0,
-                refunds_count INTEGER DEFAULT 0,
                 created_at TEXT
             )
             """
         )
         cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS refunds (
+            CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
                 token2 TEXT,
-                order_id TEXT,
-                has_photo INTEGER,
-                photo_filename TEXT,
-                text TEXT,
-                request_user_id TEXT,
-                request_message_id TEXT,
+                authorized INTEGER,
+                token_valid INTEGER,
+                can_make_more_orders TEXT,
+                rating TEXT,
+                status_value TEXT,
+                is_loyal INTEGER,
+                active_subscriptions TEXT,
+                debt_flow_enabled INTEGER,
+                debt_limit INTEGER,
+                phone TEXT,
+                phones TEXT,
+                personal_phone_id TEXT,
+                phone_id TEXT,
+                uuid TEXT,
+                account_id TEXT,
                 response_status INTEGER,
                 response_body TEXT,
-                created_at TEXT
+                created_at TEXT,
+                is_active INTEGER DEFAULT 1
             )
             """
         )
+        cursor.execute("PRAGMA table_info(accounts)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "is_active" not in columns:
+            cursor.execute("ALTER TABLE accounts ADD COLUMN is_active INTEGER DEFAULT 1")
         conn.commit()
 
 
 def upsert_user(update: Update) -> None:
     """Логируем пользователя при старте."""
     user = update.effective_user
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     is_admin = 1 if user.id in ADMIN_IDS else 0
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
@@ -94,65 +101,196 @@ def upsert_user(update: Update) -> None:
         conn.commit()
 
 
-def is_allowed(user_id: int) -> bool:
+def get_accounts_count(user_id: int) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT is_allowed FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-    return bool(row and row[0])
-
-
-def get_refunds_count(user_id: int) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT refunds_count FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
     return int(row[0]) if row else 0
 
 
-def increment_refunds_count(user_id: int) -> None:
+def token_exists(token2: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE users SET refunds_count = refunds_count + 1 WHERE user_id = ?",
-            (user_id,),
-        )
-        conn.commit()
+        cursor.execute("SELECT 1 FROM accounts WHERE token2 = ? LIMIT 1", (token2,))
+        row = cursor.fetchone()
+    return bool(row)
 
 
-def log_refund(
-    user_id: int,
-    token2: str,
-    order_id: str,
-    has_photo: bool,
-    photo_filename: str | None,
-    text: str,
-    request_user_id: str,
-    request_message_id: str,
-    response_status: int,
-    response_body: str,
-) -> None:
-    """Записываем возврат в базу."""
-    now = datetime.utcnow().isoformat()
+def get_token_owner_info(token2: str) -> tuple[str | None, str | None, int | None]:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO refunds (
-                user_id, token2, order_id, has_photo, photo_filename, text,
-                request_user_id, request_message_id, response_status, response_body, created_at
+            SELECT accounts.created_at, users.username, accounts.user_id
+            FROM accounts
+            LEFT JOIN users ON users.user_id = accounts.user_id
+            WHERE accounts.token2 = ?
+            ORDER BY accounts.created_at DESC
+            LIMIT 1
+            """,
+            (token2,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None, None, None
+    created_at, username, user_id = row
+    return created_at, username, user_id
+
+
+def deactivate_token(user_id: int, token2: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE accounts SET is_active = 0 WHERE user_id = ? AND token2 = ?",
+            (user_id, token2),
+        )
+        conn.commit()
+
+
+def get_active_tokens(user_id: int) -> list[tuple[int, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT a.id, a.token2
+            FROM accounts a
+            JOIN (
+                SELECT token2, MAX(id) AS max_id
+                FROM accounts
+                WHERE user_id = ? AND is_active = 1
+                GROUP BY token2
+            ) latest ON latest.max_id = a.id
+            ORDER BY a.created_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+    return [(int(row[0]), row[1]) for row in rows]
+
+
+def get_account_by_id(account_id: int) -> tuple[str, dict[str, object]] | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                token2,
+                authorized,
+                token_valid,
+                can_make_more_orders,
+                rating,
+                status_value,
+                is_loyal,
+                active_subscriptions,
+                debt_flow_enabled,
+                debt_limit,
+                phone,
+                phones,
+                personal_phone_id,
+                phone_id,
+                uuid,
+                account_id
+            FROM accounts
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
+        row = cursor.fetchone()
+    if not row:
+        return None
+    (
+        token2,
+        authorized,
+        token_valid,
+        can_make_more_orders,
+        rating,
+        status_value,
+        is_loyal,
+        active_subscriptions,
+        debt_flow_enabled,
+        debt_limit,
+        phone,
+        phones,
+        personal_phone_id,
+        phone_id,
+        uuid,
+        account_id,
+    ) = row
+    parsed = {
+        "authorized": bool(authorized),
+        "token_valid": bool(token_valid),
+        "can_make_more_orders": can_make_more_orders,
+        "rating": rating,
+        "status_value": status_value,
+        "is_loyal": bool(is_loyal),
+        "active_subscriptions": json.loads(active_subscriptions) if active_subscriptions else [],
+        "debt_flow_enabled": bool(debt_flow_enabled),
+        "debt_limit": debt_limit,
+        "phone": phone,
+        "phones": json.loads(phones) if phones else {},
+        "personal_phone_id": personal_phone_id,
+        "phone_id": phone_id,
+        "uuid": uuid,
+        "account_id": account_id,
+    }
+    return token2, parsed
+
+
+def log_account(
+    user_id: int,
+    token2: str,
+    parsed: dict[str, object],
+    response_status: int,
+    response_body: str,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO accounts (
+                user_id,
+                token2,
+                authorized,
+                token_valid,
+                can_make_more_orders,
+                rating,
+                status_value,
+                is_loyal,
+                active_subscriptions,
+                debt_flow_enabled,
+                debt_limit,
+                phone,
+                phones,
+                personal_phone_id,
+                phone_id,
+                uuid,
+                account_id,
+                response_status,
+                response_body,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
                 token2,
-                order_id,
-                1 if has_photo else 0,
-                photo_filename,
-                text,
-                request_user_id,
-                request_message_id,
+                1 if parsed.get("authorized") else 0,
+                1 if parsed.get("token_valid") else 0,
+                parsed.get("can_make_more_orders"),
+                parsed.get("rating"),
+                parsed.get("status_value"),
+                1 if parsed.get("is_loyal") else 0,
+                json.dumps(parsed.get("active_subscriptions"), ensure_ascii=False),
+                1 if parsed.get("debt_flow_enabled") else 0,
+                parsed.get("debt_limit"),
+                parsed.get("phone"),
+                json.dumps(parsed.get("phones"), ensure_ascii=False),
+                parsed.get("personal_phone_id"),
+                parsed.get("phone_id"),
+                parsed.get("uuid"),
+                parsed.get("account_id"),
                 response_status,
                 response_body,
                 now,
@@ -161,20 +299,67 @@ def log_refund(
         conn.commit()
 
 
-def generate_request_user_id() -> str:
-    letters = "".join(random.choices(string.ascii_letters, k=5))
-    digits = "".join(random.choices(string.digits, k=5))
-    return f"{letters}{digits}"
+def parse_typed_experiments(items: list[dict]) -> dict[str, dict]:
+    flags: dict[str, dict] = {}
+    for item in items:
+        name = item.get("name")
+        if name:
+            flags[name] = item.get("value") or {}
+    return flags
 
 
-def generate_message_id() -> str:
-    return "".join(random.choices(string.digits, k=15))
+def format_active_subscriptions(active_subscriptions: list[dict]) -> str:
+    if not active_subscriptions:
+        return "нет"
+    ids = [sub.get("subscription_id") for sub in active_subscriptions if sub.get("subscription_id")]
+    return ", ".join(ids) if ids else "есть"
+
+
+def get_nested(data: dict, keys: list[str]) -> object | None:
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def normalize_response_data(response_data: dict) -> dict:
+    if isinstance(response_data.get("data"), dict):
+        return response_data["data"]
+    return response_data
+
+
+def build_account_summary_from_parsed(parsed: dict[str, object]) -> str:
+    active_subscriptions = parsed.get("active_subscriptions") or []
+    phones = parsed.get("phones") or {}
+    can_make_more_orders = parsed.get("can_make_more_orders") or "нет данных"
+    return "\n".join(
+        [
+            "✅ <b>Аккаунт добавлен</b>",
+            f"🔐 Авторизация: <b>{'да' if parsed.get('authorized') else 'нет'}</b>",
+            f"🧩 Валидность токена: <b>{'да' if parsed.get('token_valid') else 'нет'}</b>",
+            f"🚦 Разрешение на новые заказы: <b>{can_make_more_orders}</b>",
+            f"⭐ Рейтинг: <b>{parsed.get('rating') or 'нет данных'}</b>",
+            f"🧑‍💼 Статус пассажира: <b>{parsed.get('status_value') or 'нет данных'}</b>",
+            f"🎁 Лояльность: <b>{'да' if parsed.get('is_loyal') else 'нет'}</b>",
+            f"📦 Активные подписки: <b>{format_active_subscriptions(active_subscriptions)}</b>",
+            f"💳 Долговой флоу: <b>{'включен' if parsed.get('debt_flow_enabled') else 'выключен'}</b>",
+            f"📉 Лимит долга: <b>{parsed.get('debt_limit', 'нет данных')}</b>",
+            f"📱 Телефон: <b>{parsed.get('phone', 'нет данных')}</b>",
+            f"📞 Телефоны (карта): <b>{', '.join(phones.keys()) or 'нет данных'}</b>",
+            f"🆔 Личный phone id: <b>{parsed.get('personal_phone_id', 'нет данных')}</b>",
+            f"🆔 Phone ID: <b>{parsed.get('phone_id', 'нет данных')}</b>",
+            f"🆔 UUID клиента: <b>{parsed.get('uuid', 'нет данных')}</b>",
+            f"🆔 Внутренний ID пользователя: <b>{parsed.get('account_id', 'нет данных')}</b>",
+        ]
+    )
 
 
 def main_menu_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton("👤 Профиль", callback_data="menu_profile")],
-        [InlineKeyboardButton("💸 Вернуть деньги", callback_data="menu_refund")],
+        [InlineKeyboardButton("Добавить аккаунт", callback_data="menu_add_account")],
     ]
     if is_admin:
         buttons.append([InlineKeyboardButton("🛠️ Админка", callback_data="menu_admin")])
@@ -203,183 +388,210 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    refunds_count = get_refunds_count(user_id)
+    accounts_count = get_accounts_count(user_id)
+    tokens = get_active_tokens(user_id)
+    buttons = [
+        [InlineKeyboardButton(token, callback_data=f"account_{account_id}")]
+        for account_id, token in tokens
+    ]
+    buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="profile_back")])
+    keyboard = InlineKeyboardMarkup(buttons)
     text = (
         "👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{user_id}</code>\n"
-        f"💸 Возвратов: <b>{refunds_count}</b>"
+        f"👥 Аккаунтов: <b>{accounts_count}</b>\n"
+        "👇 Добавленные аккаунты:"
     )
-    await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=main_menu_keyboard(user_id in ADMIN_IDS))
+    await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=keyboard)
 
 
-async def refund_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def add_account_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
-    if not is_allowed(user_id):
-        await query.edit_message_text(
-            "⛔️ У вас нет доступа к возвратам. Обратитесь к администратору.",
-            reply_markup=main_menu_keyboard(user_id in ADMIN_IDS),
-        )
-        return ConversationHandler.END
     context.user_data.clear()
-    await query.edit_message_text("🔐 Введите token2:")
-    return REFUND_TOKEN
+    await query.edit_message_text("🔐 Отправьте token2:")
+    return ADD_ACCOUNT_TOKEN
 
 
-async def refund_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["token2"] = update.message.text.strip()
-    await update.message.reply_text("🧾 Отправьте номер заказа:")
-    return REFUND_ORDER_ID
-
-
-async def refund_order_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["order_id"] = update.message.text.strip()
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📷 С фото", callback_data="refund_with_photo")],
-            [InlineKeyboardButton("📝 Без фото", callback_data="refund_no_photo")],
-        ]
-    )
-    await update.message.reply_text("Добавим фото?", reply_markup=keyboard)
-    return REFUND_PHOTO_CHOICE
-
-
-async def refund_photo_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    choice = query.data
-    if choice == "refund_with_photo":
-        context.user_data["has_photo"] = True
-        await query.edit_message_text("📤 Отправьте фото:")
-        return REFUND_PHOTO
-    context.user_data["has_photo"] = False
-    await query.edit_message_text("✍️ Напишите текст для возврата:")
-    return REFUND_TEXT
-
-
-async def refund_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.photo:
-        await update.message.reply_text("⚠️ Пожалуйста, отправьте фото.")
-        return REFUND_PHOTO
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    filename = f"refund_{update.effective_user.id}_{int(datetime.utcnow().timestamp())}.jpg"
-    filepath = IMAGES_DIR / filename
-    await file.download_to_drive(filepath)
-    context.user_data["photo_filename"] = filename
-    await update.message.reply_text("✍️ Теперь напишите текст для возврата:")
-    return REFUND_TEXT
-
-
-async def refund_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["text"] = update.message.text.strip()
-    summary = (
-        "📋 <b>Проверьте данные</b>\n\n"
-        f"🧾 Заказ: <code>{context.user_data.get('order_id')}</code>\n"
-        f"📝 Текст: {context.user_data.get('text')}\n"
-    )
-    if context.user_data.get("has_photo"):
-        summary += f"📷 Фото: {context.user_data.get('photo_filename')}\n"
-    else:
-        summary += "📷 Фото: нет\n"
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Вернуть", callback_data="refund_confirm")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="refund_cancel")],
-        ]
-    )
-    await update.message.reply_text(summary, parse_mode="HTML", reply_markup=keyboard)
-    return REFUND_CONFIRM
-
-
-async def refund_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await show_main_menu(update, context)
-    return ConversationHandler.END
-
-
-async def send_refund_request(
-    token2: str,
-    order_id: str,
-    text: str,
-) -> tuple[int, str, str, str]:
-    request_user_id = generate_request_user_id()
-    message_id = generate_message_id()
+async def send_launch_request(token2: str) -> tuple[int, str, dict | None]:
     headers = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Cache-Control": "no-cache,no-store,must-revalidate,max-age=-1,private",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) yandex-taxi/700.108.0.501438",
-        "Referer": "https://m.taxi.yandex.ru/",
-        "Origin": "https://m.taxi.yandex.ru",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Site": "same-origin",
-        "x-requested-uri": "https://m.taxi.yandex.ru/help/ridetech/yandex/pa/ru_ru/eats/chat",
-        "Connection": "keep-alive",
-        "Authorization": f"Bearer {token2}",
-        "Expires": "-1",
-        "Accept-Language": "ru",
-        "Accept": "application/json",
+        "User-Agent": "yandex-taxi/1.6.0.49 go-platform/0.1.19 Android/",
+        "Pragma": "no-cache",
+        "Accept": "*/*",
+        "Host": "tc.mobile.yandex.net",
         "Content-Type": "application/json",
-        "Accept-Encoding": "gzip, deflate, br",
-        "X-YaTaxi-UserId": request_user_id,
-        "Sec-Fetch-Mode": "cors",
+        "Authorization": f"Bearer {token2}",
+        "x-oauth-token": token2,
     }
-    payload = {
-        "message_id": message_id,
-        "message": text,
-        "type": "text",
-        "message_metadata": {
-            "attachments": [],
-            "user_id": request_user_id,
-            "lang": "ru",
-            "country": "rus",
-            "service": "eats",
-            "ticket_subject": "В заказе чего-то не хватает",
-            "brand": "yandex",
-            "eats_order_id": order_id,
-            "city": "omsk",
-        },
-    }
-    url = "https://m.taxi.yandex.ru/help/4.0/support_chat/v2/create_chat?service=taxi&handler_type=realtime"
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=payload)
-    return response.status_code, response.text, request_user_id, message_id
+    url = "https://tc.mobile.yandex.net/3.0/launch"
+    body = "{}"
+    print("➡️ Запрос launch", {"url": url, "headers": headers, "body": body})
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        response = await client.post(url, headers=headers, content=body)
+    print("⬅️ Ответ launch", {"status": response.status_code, "body": response.text})
+    response_json = None
+    try:
+        response_json = response.json()
+    except (json.JSONDecodeError, ValueError):
+        try:
+            response_json = json.loads(response.text)
+        except json.JSONDecodeError:
+            response_json = None
+    if not isinstance(response_json, dict):
+        response_json = None
+    return response.status_code, response.text, response_json
 
 
-async def refund_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def build_account_summary(response_data: dict) -> tuple[str, dict[str, object]]:
+    response_data = normalize_response_data(response_data)
+    flags = parse_typed_experiments(response_data.get("typed_experiments", {}).get("items", []))
+    debt_flow = flags.get("turboapp_debt_flow", {})
+    active_subscriptions = response_data.get("subscriptions", {}).get("active_subscriptions", [])
+    can_make_more_orders = get_nested(response_data, ["orders_state", "can_make_more_orders"])
+    summary_lines = [
+        "✅ <b>Аккаунт добавлен</b>",
+        f"🔐 Авторизация: <b>{'да' if response_data.get('authorized') else 'нет'}</b>",
+        f"🧩 Валидность токена: <b>{'да' if response_data.get('token_valid') else 'нет'}</b>",
+        f"🚦 Разрешение на новые заказы: <b>{can_make_more_orders or 'нет данных'}</b>",
+        f"⭐ Рейтинг: <b>{get_nested(response_data, ['passenger_profile', 'rating']) or 'нет данных'}</b>",
+        f"🧑‍💼 Статус пассажира: <b>{get_nested(response_data, ['passenger_profile', 'status', 'value']) or 'нет данных'}</b>",
+        f"🎁 Лояльность: <b>{'да' if response_data.get('is_loyal') else 'нет'}</b>",
+        f"📦 Активные подписки: <b>{format_active_subscriptions(active_subscriptions)}</b>",
+        f"💳 Долговой флоу: <b>{'включен' if debt_flow.get('enabled') else 'выключен'}</b>",
+        f"📉 Лимит долга: <b>{debt_flow.get('debt_limit', 'нет данных')}</b>",
+        f"📱 Телефон: <b>{response_data.get('phone', 'нет данных')}</b>",
+        f"📞 Телефоны (карта): <b>{', '.join(response_data.get('phones', {}).keys()) or 'нет данных'}</b>",
+        f"🆔 Личный phone id: <b>{response_data.get('personal_phone_id', 'нет данных')}</b>",
+        f"🆔 Phone ID: <b>{response_data.get('phone_id', 'нет данных')}</b>",
+        f"🆔 UUID клиента: <b>{response_data.get('uuid', 'нет данных')}</b>",
+        f"🆔 Внутренний ID пользователя: <b>{response_data.get('id', 'нет данных')}</b>",
+    ]
+
+    parsed = {
+        "authorized": response_data.get("authorized"),
+        "token_valid": response_data.get("token_valid"),
+        "can_make_more_orders": can_make_more_orders,
+        "rating": get_nested(response_data, ["passenger_profile", "rating"]),
+        "status_value": get_nested(response_data, ["passenger_profile", "status", "value"]),
+        "is_loyal": response_data.get("is_loyal"),
+        "active_subscriptions": active_subscriptions,
+        "debt_flow_enabled": debt_flow.get("enabled"),
+        "debt_limit": debt_flow.get("debt_limit"),
+        "phone": response_data.get("phone"),
+        "phones": response_data.get("phones"),
+        "personal_phone_id": response_data.get("personal_phone_id"),
+        "phone_id": response_data.get("phone_id"),
+        "uuid": response_data.get("uuid"),
+        "account_id": response_data.get("id"),
+    }
+    return "\n".join(summary_lines), parsed
+
+
+async def process_add_account(message, user, token2: str) -> None:
+    status_code, response_text, response_json = await send_launch_request(token2)
+    if response_json is None:
+        log_account(
+            user_id=user.id,
+            token2=token2,
+            parsed={},
+            response_status=status_code,
+            response_body=response_text,
+        )
+        await message.reply_text(
+            "⚠️ Не удалось распарсить ответ сервера. "
+            "Ответ сохранён в базе, проверьте token2 и попробуйте снова."
+        )
+    else:
+        summary, parsed = build_account_summary(response_json)
+        log_account(
+            user_id=user.id,
+            token2=token2,
+            parsed=parsed,
+            response_status=status_code,
+            response_body=response_text,
+        )
+        await message.reply_text(summary, parse_mode="HTML")
+    await message.reply_text(
+        "✨ Главное меню", reply_markup=main_menu_keyboard(user.id in ADMIN_IDS)
+    )
+
+
+async def add_account_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    token2 = update.message.text.strip()
+    context.user_data["token2"] = token2
+    if token_exists(token2):
+        created_at, username, user_id = get_token_owner_info(token2)
+        owner_line = ""
+        if created_at:
+            owner_name = f"@{username}" if username else f"id {user_id}"
+            owner_line = f"\nПоследний ввод: <b>{created_at}</b> ({owner_name})"
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ Да", callback_data="add_account_confirm_yes")],
+                [InlineKeyboardButton("❌ Нет", callback_data="add_account_confirm_no")],
+            ]
+        )
+        await update.message.reply_text(
+            "⚠️ Такой token2 уже добавляли. Точно добавить этот аккаунт?"
+            f"{owner_line}",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+        return ADD_ACCOUNT_CONFIRM
+    await process_add_account(update.message, update.effective_user, token2)
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def add_account_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    user_id = update.effective_user.id
+    if query.data == "add_account_confirm_no":
+        context.user_data.clear()
+        await query.edit_message_text("🔐 Отправьте другой token2:")
+        return ADD_ACCOUNT_TOKEN
     token2 = context.user_data.get("token2")
-    order_id = context.user_data.get("order_id")
-    text = context.user_data.get("text")
-    status_code, response_text, request_user_id, message_id = await send_refund_request(
-        token2=token2,
-        order_id=order_id,
-        text=text,
-    )
-    log_refund(
-        user_id=user_id,
-        token2=token2,
-        order_id=order_id,
-        has_photo=context.user_data.get("has_photo", False),
-        photo_filename=context.user_data.get("photo_filename"),
-        text=text,
-        request_user_id=request_user_id,
-        request_message_id=message_id,
-        response_status=status_code,
-        response_body=response_text,
-    )
-    increment_refunds_count(user_id)
+    await query.edit_message_text("⏳ Проверяю token2...")
+    await process_add_account(query.message, update.effective_user, token2)
     context.user_data.clear()
-    pretty_response = f"📨 Ответ сервера:\n<code>{response_text}</code>"
-    await query.edit_message_text(pretty_response, parse_mode="HTML")
-    await query.message.reply_text(
-        "✨ Главное меню", reply_markup=main_menu_keyboard(user_id in ADMIN_IDS)
-    )
     return ConversationHandler.END
+
+
+async def account_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    account_id = int(query.data.split("_", 1)[1])
+    account_data = get_account_by_id(account_id)
+    if not account_data:
+        await query.edit_message_text("⚠️ Аккаунт не найден.", reply_markup=main_menu_keyboard(False))
+        return
+    token2, parsed = account_data
+    summary = build_account_summary_from_parsed(parsed)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑️ Удалить", callback_data=f"account_delete_{account_id}")],
+            [InlineKeyboardButton("⬅️ В меню", callback_data="profile_back")],
+        ]
+    )
+    await query.edit_message_text(
+        text=f"🔑 <code>{token2}</code>\n\n{summary}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def account_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    account_id = int(query.data.split("_", 2)[2])
+    account_data = get_account_by_id(account_id)
+    if not account_data:
+        await query.edit_message_text("⚠️ Аккаунт не найден.")
+        return
+    token2, _parsed = account_data
+    deactivate_token(update.effective_user.id, token2)
+    await query.edit_message_text("✅ Аккаунт удалён из профиля.")
+    await show_main_menu(update, context)
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -391,7 +603,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ Выдать доступ", callback_data="admin_grant")],
-            [InlineKeyboardButton("🔎 Возвраты пользователя", callback_data="admin_refunds")],
+            [InlineKeyboardButton("🔎 Аккаунты пользователя", callback_data="admin_refunds")],
             [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="admin_back")],
         ]
@@ -405,14 +617,14 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await query.answer()
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM refunds")
-        total_refunds = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM accounts")
+        total_accounts = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM users")
         total_users = cursor.fetchone()[0]
     text = (
         "📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: <b>{total_users}</b>\n"
-        f"💸 Возвратов: <b>{total_refunds}</b>"
+        f"👤 Аккаунтов: <b>{total_accounts}</b>"
     )
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=main_menu_keyboard(True))
 
@@ -444,7 +656,7 @@ async def admin_handle_user_id(update: Update, context: ContextTypes.DEFAULT_TYP
                 VALUES (?, 1, ?)
                 ON CONFLICT(user_id) DO UPDATE SET is_allowed = 1
                 """,
-                (target_user_id, datetime.utcnow().isoformat()),
+                (target_user_id, datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
         await update.message.reply_text("✅ Доступ выдан.")
@@ -452,13 +664,13 @@ async def admin_handle_user_id(update: Update, context: ContextTypes.DEFAULT_TYP
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT refunds_count FROM users WHERE user_id = ?",
+                "SELECT COUNT(*) FROM accounts WHERE user_id = ?",
                 (target_user_id,),
             )
             row = cursor.fetchone()
-        refunds_count = int(row[0]) if row else 0
+        accounts_count = int(row[0]) if row else 0
         await update.message.reply_text(
-            f"📋 Возвратов у пользователя {target_user_id}: <b>{refunds_count}</b>",
+            f"📋 Аккаунтов у пользователя {target_user_id}: <b>{accounts_count}</b>",
             parse_mode="HTML",
         )
     context.user_data.clear()
@@ -469,17 +681,12 @@ async def admin_handle_user_id(update: Update, context: ContextTypes.DEFAULT_TYP
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    refund_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(refund_entry, pattern="^menu_refund$")],
+    add_account_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_account_entry, pattern="^menu_add_account$")],
         states={
-            REFUND_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, refund_token)],
-            REFUND_ORDER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, refund_order_id)],
-            REFUND_PHOTO_CHOICE: [CallbackQueryHandler(refund_photo_choice, pattern="^refund_")],
-            REFUND_PHOTO: [MessageHandler(filters.PHOTO, refund_photo)],
-            REFUND_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, refund_text)],
-            REFUND_CONFIRM: [
-                CallbackQueryHandler(refund_confirm, pattern="^refund_confirm$"),
-                CallbackQueryHandler(refund_cancel, pattern="^refund_cancel$"),
+            ADD_ACCOUNT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_token)],
+            ADD_ACCOUNT_CONFIRM: [
+                CallbackQueryHandler(add_account_confirm, pattern="^add_account_confirm_")
             ],
         },
         fallbacks=[CommandHandler("start", start)],
@@ -500,11 +707,13 @@ def build_app():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(profile, pattern="^menu_profile$"))
+    app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^profile_back$"))
+    app.add_handler(CallbackQueryHandler(account_details, pattern="^account_\\d+$"))
+    app.add_handler(CallbackQueryHandler(account_delete, pattern="^account_delete_\\d+$"))
     app.add_handler(CallbackQueryHandler(admin_menu, pattern="^menu_admin$"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(show_main_menu, pattern="^admin_back$"))
-    app.add_handler(CallbackQueryHandler(refund_cancel, pattern="^refund_cancel$"))
-    app.add_handler(refund_handler)
+    app.add_handler(add_account_handler)
     app.add_handler(admin_handler)
 
     return app
